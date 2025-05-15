@@ -1,0 +1,179 @@
+import org.apache.spark.sql.*;
+import org.apache.spark.sql.functions;
+import org.apache.spark.sql.Column;
+import org.springframework.stereotype.Component;
+import java.util.*;
+
+// --- Attribute Calculator Interface ---
+interface AttributeCalculator {
+    String getAttributeName();
+    List<String> getInputColumns();
+    Column compute(Map<String, Column> inputs);
+    Set<String> supportedSources(); // List of supported sources (e.g., A, B, C)
+}
+
+// --- Sample Calculator: Age ---
+@Component
+class AgeCalculator implements AttributeCalculator {
+    public String getAttributeName() { return "age"; }
+
+    public List<String> getInputColumns() {
+        return List.of("birthDate");
+    }
+
+    public Column compute(Map<String, Column> inputs) {
+        return functions.floor(functions.months_between(functions.current_date(), inputs.get("birthDate")).divide(12));
+    }
+
+    public Set<String> supportedSources() {
+        return Set.of("A", "B", "C");
+    }
+}
+
+// --- Sample Calculator: BMI ---
+@Component
+class BMICalculator implements AttributeCalculator {
+    public String getAttributeName() { return "bmi"; }
+
+    public List<String> getInputColumns() {
+        return List.of("weight", "height");
+    }
+
+    public Column compute(Map<String, Column> inputs) {
+        return inputs.get("weight").divide(inputs.get("height").multiply(inputs.get("height")));
+    }
+
+    public Set<String> supportedSources() {
+        return Set.of("A", "B");
+    }
+}
+
+// --- Sample Calculator: Risk Score (depends on BMI and Age) ---
+@Component
+class RiskScoreCalculator implements AttributeCalculator {
+    public String getAttributeName() { return "riskScore"; }
+
+    public List<String> getInputColumns() {
+        return List.of("age", "bmi");
+    }
+
+    public Column compute(Map<String, Column> inputs) {
+        return inputs.get("bmi").multiply(0.5).plus(inputs.get("age").multiply(0.3));
+    }
+
+    public Set<String> supportedSources() {
+        return Set.of("C");
+    }
+}
+
+// --- Attribute Engine ---
+@Component
+class AttributeEngine {
+    private final Map<String, List<AttributeCalculator>> calculatorsByAttribute = new HashMap<>();
+
+    public AttributeEngine(List<AttributeCalculator> calculatorBeans) {
+        for (AttributeCalculator calc : calculatorBeans) {
+            calculatorsByAttribute.computeIfAbsent(calc.getAttributeName(), k -> new ArrayList<>()).add(calc);
+        }
+    }
+
+    public Dataset<Row> applyAttributes(Dataset<Row> dataset, Set<String> targetAttributes) {
+        Set<String> datasetColumns = new HashSet<>(Arrays.asList(dataset.columns()));
+        for (String attribute : targetAttributes) {
+            dataset = computeAttribute(dataset, attribute, datasetColumns);
+        }
+        return dataset;
+    }
+
+    private Dataset<Row> computeAttribute(Dataset<Row> dataset, String attribute, Set<String> datasetColumns) {
+        if (datasetColumns.contains(attribute)) return dataset;
+
+        List<AttributeCalculator> calculators = calculatorsByAttribute.get(attribute);
+        if (calculators == null || calculators.isEmpty()) {
+            throw new IllegalArgumentException("Unknown attribute or column: " + attribute);
+        }
+
+        for (AttributeCalculator calculator : calculators) {
+            Set<String> supportedSources = calculator.supportedSources();
+            for (String source : supportedSources) {
+                // Filter dataset by SOR
+                Column sourceCondition = functions.col("SOR").equalTo(source);
+                Dataset<Row> sourceSubset = dataset.filter(sourceCondition);
+
+                // Only compute if needed
+                if (!Arrays.asList(sourceSubset.columns()).contains(attribute)) {
+                    Map<String, Column> inputs = new HashMap<>();
+                    for (String dep : calculator.getInputColumns()) {
+                        if (!Arrays.asList(dataset.columns()).contains(dep)) {
+                            if (!calculatorsByAttribute.containsKey(dep)) {
+                                throw new IllegalArgumentException("Missing input column and no calculator found: " + dep);
+                            }
+                            dataset = computeAttribute(dataset, dep, datasetColumns);
+                        }
+                        inputs.put(dep, functions.col(dep));
+                    }
+
+                    Column result = calculator.compute(inputs);
+                    Column conditionalResult = functions.when(sourceCondition, result).otherwise(functions.col(attribute));
+
+                    if (!datasetColumns.contains(attribute)) {
+                        dataset = dataset.withColumn(attribute, conditionalResult);
+                        datasetColumns.add(attribute);
+                    } else {
+                        dataset = dataset.withColumn(attribute, conditionalResult);
+                    }
+                }
+            }
+        }
+
+        return dataset;
+    }
+}
+
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
+import org.apache.spark.sql.SparkSession;
+import org.springframework.boot.CommandLineRunner;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
+
+import java.util.Set;
+
+@SpringBootApplication
+public class AttributeApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(AttributeApplication.class, args);
+    }
+
+    @Bean
+    public SparkSession sparkSession() {
+        return SparkSession.builder()
+                .appName("AttributePipeline")
+                .master("local[*]") // Change this for cluster deployment
+                .getOrCreate();
+    }
+
+    @Bean
+    public CommandLineRunner run(AttributeEngine engine, SparkSession spark) {
+        return args -> {
+            // Load your initial dataset
+            Dataset<Row> dataset = spark.read()
+                .option("header", true)
+                .csv("path/to/input.csv"); // replace with actual path or source
+
+            // Define which attributes to calculate
+            Set<String> attributesToCompute = Set.of("age", "bmi", "riskScore");
+
+            // Run the attribute pipeline
+            Dataset<Row> result = engine.applyAttributes(dataset, attributesToCompute);
+
+            // Show or write result
+            result.show();
+            // result.write().format("parquet").save("path/to/output");
+        };
+    }
+}
+
+
